@@ -143,10 +143,7 @@
 
   /* ---------------- M3 本地收藏 ---------------- */
   var Store = (function () {
-    var DEFAULTS = [
-      { room: 12818, num: '224' }, { room: 12818, num: '228' }, { room: 12818, num: '281' },
-      { room: 12818, num: '215' }, { room: 12818, num: '227' }, { room: 11226, num: '054' }
-    ];
+    var DEFAULTS = [];   // 不预置任何座位，首次使用为空，由使用者自行“点选添加/手输添加”高频座位
     function load() {
       try { var a = JSON.parse(localStorage.getItem(STORE_KEY)); return Array.isArray(a) ? a : DEFAULTS.slice(); }
       catch (e) { return DEFAULTS.slice(); }
@@ -479,7 +476,7 @@
         '<div id="sq-chain"></div>' +
         '<div class="sq-list" id="sq-list">加载中…</div>' +
         '<div class="sq-add"><select id="sq-addroom"><option value="11226">24h空间</option><option value="12818" selected>2F</option><option value="12819">3F</option><option value="12820">4F</option></select>' +
-        '<input id="sq-addnum" placeholder="座位号 如224" inputmode="numeric">' +
+        '<input id="sq-addnum" placeholder="座位号 如001" inputmode="numeric">' +
         '<button class="sq-btn" id="sq-goroom" title="在本面板列表中滚动定位到所选楼层分区（不跳转页面）">↓到楼层</button>' +
         '<button class="sq-btn ghost" id="sq-addbtn">☆收藏</button>' +
         '<button class="sq-btn ghost" id="sq-findbtn" title="在官方座位图上闪烁定位该座位（不选座）">◎定位</button></div>' +
