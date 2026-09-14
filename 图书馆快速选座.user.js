@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         图书馆座位快速选座助手（河工职大 · 超星座位）
 // @namespace    hbcit.seat.quick
-// @version      1.4.6
+// @version      1.4.8
 // @description  高频座位空窗速览 + 一键预选到官方“提交”前；只读取数据、只帮你选好，提交与验证码永远由本人完成。电脑端(Chrome/Edge+Tampermonkey)与安卓端(Kiwi/Firefox+Tampermonkey)同一份脚本。
 // @match        *://office.chaoxing.com/front/third/apps/seat/*
 // @match        *://*.chaoxing.com/front/third/apps/seat/*
+// @match        *://os.hbcit.edu.cn/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -20,6 +21,41 @@
   'use strict';
   if (window.__seatQuickLoaded) return;
   window.__seatQuickLoaded = true;
+
+  /* ---------------- M0 学校门户(os.hbcit.edu.cn)：一键直达座位预约 ---------------- */
+  var PortalJump = (function () {
+    var AUTO_KEY = 'seatQuick.portalAuto';
+    var SEAT_URL = 'https://office.chaoxing.com/front/third/apps/seat/list?deptIdEnc=087075e03ab2e001';
+    function autoOn() { try { return localStorage.getItem(AUTO_KEY) === '1'; } catch (e) { return false; } }
+    function isPortalHome() {
+      var p = location.pathname.replace(/\/+$/, '');
+      return p === '' || p === '/' || p === '/index' || p === '/mobile';
+    }
+    function mount() {
+      if (!isPortalHome()) return;
+      if (autoOn()) { location.replace(SEAT_URL); return; }  // 自动模式：替换历史，返回键不会循环
+      var box = document.createElement('div');
+      box.style.cssText = 'position:fixed;right:12px;bottom:78px;z-index:2147483000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;font-family:inherit;';
+      var go = document.createElement('button');
+      go.textContent = '⚡ 座位预约 一键直达';
+      go.style.cssText = 'border:none;background:#2563eb;color:#fff;border-radius:22px;padding:12px 18px;font-size:14.5px;font-weight:700;box-shadow:0 4px 14px rgba(37,99,235,.4);cursor:pointer;';
+      go.onclick = function () { location.href = SEAT_URL; };
+      var sw = document.createElement('button');
+      function syncSw() { sw.textContent = '门户自动跳转：' + (autoOn() ? '开' : '关'); }
+      sw.style.cssText = 'border:1px solid #cbd5e1;background:rgba(255,255,255,.94);color:#475569;border-radius:16px;padding:6px 12px;font-size:12px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.12);';
+      sw.onclick = function () {
+        try { localStorage.setItem(AUTO_KEY, autoOn() ? '0' : '1'); } catch (e) {}
+        syncSw();
+        sw.title = autoOn() ? '已开启：一进门户首页自动跳到座位预约' : '已关闭：点上方按钮手动直达';
+      };
+      syncSw();
+      box.appendChild(go); box.appendChild(sw);
+      function attach() { document.body.appendChild(box); }
+      if (document.body) attach(); else document.addEventListener('DOMContentLoaded', attach);
+    }
+    return { mount: mount, SEAT_URL: SEAT_URL };
+  })();
+  if (/^os\.hbcit\.edu\.cn$/i.test(location.hostname)) { PortalJump.mount(); return; }
 
   /* ---------------- M1 数据层 ---------------- */
   var ROOMS = [
@@ -199,6 +235,44 @@
     }
     return { load: load, add: add, remove: remove };
   })();
+
+  /* ---------------- M3.5 分区（无电区：内置号段 + 使用者自定义座位） ---------------- */
+  var NP_KEY = 'seatQuick.noPower.v1';
+  var BUILTIN_ZONES = [
+    { room: 12818, from: 169, to: 211, name: '无电区' }  // 2F阅览区 169-211 号为无电座（两端含）
+  ];
+  var NoPower = (function () {
+    function loadSet() {
+      try { var a = JSON.parse(localStorage.getItem(NP_KEY)); return Array.isArray(a) ? a.slice() : []; }
+      catch (e) { return []; }
+    }
+    function key(room, num) { return Number(room) + ':' + String(num).padStart(3, '0'); }
+    function list() { return loadSet(); }
+    function has(room, num) { return loadSet().indexOf(key(room, num)) >= 0; }
+    function add(room, nums) {
+      var a = loadSet(); var added = 0;
+      nums.forEach(function (n) {
+        var k = key(room, n); if (a.indexOf(k) < 0) { a.push(k); added++; }
+      });
+      try { localStorage.setItem(NP_KEY, JSON.stringify(a)); } catch (e) {}
+      return added;
+    }
+    function remove(k) {
+      try { localStorage.setItem(NP_KEY, JSON.stringify(loadSet().filter(function (x) { return x !== k; }))); } catch (e) {}
+    }
+    return { list: list, has: has, add: add, remove: remove, key: key };
+  })();
+  // 返回 {name,custom:false内置/true自定义} 或 null
+  function zoneOf(room, num) {
+    var n = Number(num);
+    for (var i = 0; i < BUILTIN_ZONES.length; i++) {
+      var z = BUILTIN_ZONES[i];
+      if (Number(room) === z.room && n >= z.from && n <= z.to) return { name: z.name, custom: false };
+    }
+    if (NoPower.has(room, num)) return { name: '无电区', custom: true };
+    return null;
+  }
+  function isNoPower(room, num) { return !!zoneOf(room, num); }
 
   /* ---------------- M5 一键预选（只选不交） ---------------- */
   var Preselect = (function () {
@@ -444,7 +518,8 @@
 
   /* ---------------- M4 面板 UI ---------------- */
   var UI = (function () {
-    var state = { day: 'tomorrow', target: 240, sort: 'longest', winS: null, winE: null, expanded: {} };
+    var state = { day: 'tomorrow', target: 240, sort: 'longest', winS: null, winE: null, expanded: {},
+      power: (function () { try { return localStorage.getItem('seatQuick.powerFilter') || 'all'; } catch (e) { return 'all'; } })() };
     function mount() {
       var old = document.getElementById('sq-root'); if (old) old.remove();
       var root = document.createElement('div'); root.id = 'sq-root';
@@ -501,6 +576,16 @@
         '.sq-srow .n{font-weight:700;color:#0f172a;width:40px;flex:none;}' +
         '.sq-srow .w{color:#15803d;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
         '.sq-star{flex:none;border:none;background:transparent;color:#f59e0b;font-size:15px;line-height:1;cursor:pointer;padding:0 2px;}' +
+        '.sq-ztag{flex:none;font-size:10.5px;font-weight:700;border-radius:5px;padding:1px 5px;margin-left:4px;background:#e2e8f0;color:#475569;}' +
+        '.sq-ztag.custom{background:#fef3c7;color:#92400e;cursor:pointer;}' +
+        '#sq-zonepop{display:none;border-bottom:1px solid #e5e7eb;background:#f8fafc;padding:8px 10px;flex-direction:column;gap:6px;}' +
+        '#sq-zonepop .zp-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;color:#475569;}' +
+        '#sq-zonepop select,#sq-zonepop input{font-size:12.5px;padding:5px 7px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;}' +
+        '#sq-zonepop input{flex:1;min-width:90px;}' +
+        '#sq-zonepop .zp-add{border:none;background:#2563eb;color:#fff;border-radius:7px;padding:6px 12px;font-size:12.5px;font-weight:600;cursor:pointer;}' +
+        '.zp-chips{display:flex;flex-wrap:wrap;gap:5px;}' +
+        '.zp-chips button{border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:12px;font-size:11.5px;padding:3px 8px;cursor:pointer;}' +
+        '.zp-tip{font-size:11px;color:#94a3b8;line-height:1.5;}' +
         '.sq-more{width:100%;margin-top:5px;border:1px dashed #cbd5e1;background:#fff;color:#475569;border-radius:7px;padding:6px;font-size:12px;cursor:pointer;}' +
         '#sq-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:2147483002;display:none;}' +
         '#sq-picker{position:fixed;left:50%;bottom:0;transform:translateX(-50%);width:min(460px,100%);max-height:80vh;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -8px 30px rgba(0,0,0,.25);z-index:2147483003;display:none;flex-direction:column;padding:13px 13px calc(14px + env(safe-area-inset-bottom));}' +
@@ -536,6 +621,9 @@
         '<select id="sq-target"><option value="0">不限</option><option value="60">1h</option><option value="120">2h</option><option value="180">3h</option><option value="240" selected>4h</option></select></label>' +
         '<label style="font-size:12px;color:#475569;">排序 ' +
         '<select id="sq-sort"><option value="longest">最长优先</option><option value="custom">我的顺序</option></select></label>' +
+        '<label style="font-size:12px;color:#475569;">电源 ' +
+        '<select id="sq-power"><option value="all">全部</option><option value="power">仅有电</option><option value="nopower">仅无电区</option></select></label>' +
+        '<button class="sq-btn ghost" id="sq-zonemgr" title="管理自定义无电座位">🔌无电区管理</button>' +
         '<button class="sq-btn" id="sq-refresh">刷新</button>' +
         '<button class="sq-btn ghost" id="sq-pickmode" title="在官方座位图上点座位直接加入高频">⭐点选添加</button>' +
         '<button class="sq-btn ghost" id="sq-assist" title="点两个时间块后自动确认，再点座位即可">⏱ 选时自动确认：开</button>' +
@@ -546,6 +634,12 @@
         '<select id="sq-ws"></select><span>至</span><select id="sq-we"></select>' +
         '<span id="sq-winhint" style="color:#94a3b8;font-size:11px;">（不选=按“至少”时长筛全部空座）</span></label></div>' +
         '<div id="sq-picktip">点选模式：直接点击官方座位图中的座位即可加入高频（<b>不会触发预约</b>），已收藏座位有橙色描边；再点一次“⭐点选添加”退出。</div>' +
+        '<div id="sq-zonepop"><div class="zp-row"><b>自定义无电座</b>' +
+        '<select id="zp-room"><option value="11226">24h空间</option><option value="12818" selected>2F</option><option value="12819">3F</option><option value="12820">4F</option></select>' +
+        '<input id="zp-num" placeholder="座位号，可填 172 或 172,175 或 172-175" inputmode="text">' +
+        '<button class="zp-add" id="zp-add">加入无电</button></div>' +
+        '<div class="zp-chips" id="zp-chips"></div>' +
+        '<div class="zp-tip">内置无电区：2F阅览区 169-211 号（灰色“无电”标，不可删）；你自己加的为黄色标，点标签可移除。</div></div>' +
         '<div id="sq-chain"></div>' +
         '<div class="sq-list" id="sq-list">加载中…</div>' +
         '<div class="sq-add"><select id="sq-addroom"><option value="11226">24h空间</option><option value="12818" selected>2F</option><option value="12819">3F</option><option value="12820">4F</option></select>' +
@@ -662,7 +756,8 @@
       function openPicker(room, num, day, maxMin, wins, blks) {
         PICK = { room: Number(room), num: num, day: day, maxMin: maxMin, blocks: blks || [], s: -1, e: -1 };
         $('#pk-title').textContent = num + ' 号 · 选时间';
-        $('#pk-sub').textContent = (ROOMSHORT[room] || '') + ' · ' + (day || '');
+        var z0 = zoneOf(room, num);
+        $('#pk-sub').textContent = (ROOMSHORT[room] || '') + ' · ' + (day || '') + (z0 ? ' · ' + z0.name : '');
         // 顶部快捷空段（一键选最长空窗；超4h标分2段）
         var q = $('#pk-quick'); q.innerHTML = '<span class="pk-q-tip">快捷</span>';
         (wins || []).forEach(function (t) {
@@ -723,6 +818,49 @@
       };
       $('#sq-target').onchange = function (e) { state.target = Number(e.target.value); render(); };
       $('#sq-sort').onchange = function (e) { state.sort = e.target.value; render(); };
+      // 电源筛选
+      $('#sq-power').value = state.power;
+      $('#sq-power').onchange = function (e) {
+        state.power = e.target.value;
+        try { localStorage.setItem('seatQuick.powerFilter', state.power); } catch (er) {}
+        state.expanded = {}; render();
+      };
+      // 无电区自定义管理
+      function renderZoneChips() {
+        var box = $('#zp-chips'); box.innerHTML = '';
+        var all = NoPower.list();
+        if (!all.length) box.innerHTML = '<span class="zp-tip">还没有自定义无电座（内置 2F 169-211 始终生效）</span>';
+        all.forEach(function (k) {
+          var p = k.split(':'), b = document.createElement('button');
+          b.textContent = (ROOMSHORT[p[0]] || p[0]) + ' ' + p[1] + ' ×';
+          b.title = '点此移除';
+          b.onclick = function () { NoPower.remove(k); renderZoneChips(); render(true); };
+          box.appendChild(b);
+        });
+      }
+      $('#sq-zonemgr').onclick = function () {
+        var pop = $('#sq-zonepop');
+        var show = pop.style.display !== 'flex';
+        pop.style.display = show ? 'flex' : 'none';
+        this.classList.toggle('on', show);
+        if (show) renderZoneChips();
+      };
+      $('#zp-add').onclick = function () {
+        var room = Number($('#zp-room').value), raw = $('#zp-num').value.trim();
+        if (!raw) { toast('先填座位号，如 172 或 172,175 或 172-175'); return; }
+        var nums = [], m;
+        raw.split(/[,，、\s]+/).filter(Boolean).forEach(function (tok) {
+          if ((m = tok.match(/^(\d{1,3})\s*[-~到]\s*(\d{1,3})$/))) {
+            var a = Number(m[1]), b2 = Number(m[2]);
+            if (b2 < a) { var t2 = a; a = b2; b2 = t2; }
+            for (var x = a; x <= b2 && x <= 999; x++) nums.push(x);
+          } else if (/^\d{1,3}$/.test(tok)) nums.push(Number(tok));
+        });
+        if (!nums.length) { toast('没认出座位号格式，例：172、172,175、172-175'); return; }
+        var n = NoPower.add(room, nums);
+        $('#zp-num').value = ''; renderZoneChips(); render(true);
+        toast('已把 ' + n + ' 个座位加入' + (ROOMSHORT[room] || '') + '无电区');
+      };
       // 指定时段下拉（08:00–22:00，整点）
       function hh(h) { return String(h).padStart(2, '0') + ':00'; }
       function fillHours(sel, from, to, withAny) {
@@ -868,15 +1006,25 @@
             return { room: f.room, num: f.num, c: Calc.detail(d, f.num, day, serverNow) };
           }).filter(Boolean).filter(function (f) { return qualifies(f.c); });
           if (state.sort === 'longest') favs.sort(function (a, b) { return b.c.longest - a.c.longest; });
-          // ② 其余座位按楼层分区（排除已在高频里的）
-          var sections = FLOORORDER.map(function (rid) {
+          // ② 其余座位按楼层分区（排除已在高频里的），每个楼层再拆“普通/无电区”两个小节
+          var sections = [];
+          FLOORORDER.forEach(function (rid) {
             var d = dmap[rid];
-            var rows = d ? (smap[rid] || []).filter(function (n) { return !favSet[rid + ':' + n]; })
+            var allRows = d ? (smap[rid] || []).filter(function (n) { return !favSet[rid + ':' + n]; })
               .map(function (n) { return { room: rid, num: n, c: Calc.detail(d, n, day, serverNow) }; })
               .filter(function (x) { return qualifies(x.c); })
               .sort(function (a, b) { return Number(a.num) - Number(b.num); }) : [];
-            return { rid: rid, rows: rows };
+            var mainRows = allRows.filter(function (x) { return !isNoPower(rid, x.num); });
+            var zoneRows = allRows.filter(function (x) { return isNoPower(rid, x.num); });
+            if (state.power !== 'nopower') sections.push({ key: String(rid), rid: rid, zone: false, rows: mainRows });
+            if (state.power !== 'power' && zoneRows.length) sections.push({ key: rid + ':z', rid: rid, zone: true, rows: zoneRows });
           });
+          function ztagHtml(room, num) {
+            var z = zoneOf(room, num);
+            if (!z) return '';
+            return '<span class="sq-ztag' + (z.custom ? ' custom' : '') + '" data-zrm="' + room + '" data-zn="' + num +
+              '" title="' + (z.custom ? '我加的无电座，点此移除' : '内置无电区 169-211') + '">无电</span>';
+          }
           var totalOther = sections.reduce(function (s, x) { return s + x.rows.length; }, 0);
           list.innerHTML = '';
           // —— 高频区 ——
@@ -910,7 +1058,7 @@
             card.setAttribute('data-pick', '1'); card.dataset.r = f.room; card.dataset.n = f.num;
             card.dataset.w = f.c.bookableTxt.join('|');
             card.innerHTML =
-              '<div class="sq-row1"><span class="sq-no">' + f.num + '</span><span class="sq-tag">' + (ROOMSHORT[f.room] || '') + '</span>' +
+              '<div class="sq-row1"><span class="sq-no">' + f.num + '</span><span class="sq-tag">' + (ROOMSHORT[f.room] || '') + '</span>' + ztagHtml(f.room, f.num) +
               '<span class="sq-badge" style="background:' + bd[1] + ';color:' + bd[2] + '">' + bd[0] + ' · 最长' + f.c.longestTxt + '</span>' +
               '<button class="sq-x" data-rm="' + f.room + '" data-rn="' + f.num + '" title="移除">×</button></div>' +
               '<div class="sq-bar">' + bars + '</div><div class="sq-chips">' + chips + '</div>';
@@ -919,14 +1067,14 @@
           // —— 楼层区 ——
           sections.forEach(function (sec) {
             var head = document.createElement('div'); head.className = 'sq-sec'; head.dataset.rid = sec.rid;
-            head.innerHTML = esc(SECNAME[sec.rid]) + ' <small>空余 ' + sec.rows.length + ' 个</small>';
+            head.innerHTML = esc(SECNAME[sec.rid] + (sec.zone ? ' · 无电区' : '')) + ' <small>空余 ' + sec.rows.length + ' 个</small>';
             list.appendChild(head);
             if (!sec.rows.length) {
               var ne = document.createElement('div'); ne.className = 'sq-none';
               ne.textContent = hasWin ? '该时段此层无整段空余座位' : '此层无符合时长的空余座位';
               list.appendChild(ne); return;
             }
-            var shown = state.expanded[sec.rid] ? sec.rows : sec.rows.slice(0, ROW_LIMIT);
+            var shown = state.expanded[sec.key] ? sec.rows : sec.rows.slice(0, ROW_LIMIT);
             var box = document.createElement('div'); box.className = 'sq-seats';
             box.innerHTML = shown.map(function (x) {
               var winDesc;
@@ -936,13 +1084,13 @@
               } else winDesc = x.c.bookableTxt.join(' ');
               var t = pickChip(x.c);
               return '<div class="sq-srow" data-pick="1" data-r="' + x.room + '" data-n="' + x.num + '" data-t="' + t + '" data-w="' + x.c.bookableTxt.join('|') + '" title="点座位号弹出可选时段">' +
-                '<span class="n">' + x.num + '</span><span class="w">' + esc(winDesc) + '</span>' +
+                '<span class="n">' + x.num + '</span>' + ztagHtml(x.room, x.num) + '<span class="w">' + esc(winDesc) + '</span>' +
                 '<button class="sq-star" data-add="' + x.room + '" data-an="' + x.num + '" title="加入高频">☆</button></div>';
             }).join('');
             list.appendChild(box);
             if (sec.rows.length > shown.length) {
               var more = document.createElement('button');
-              more.className = 'sq-more'; more.dataset.more = sec.rid;
+              more.className = 'sq-more'; more.dataset.more = sec.key;
               more.textContent = '展开剩余 ' + (sec.rows.length - shown.length) + ' 个';
               list.appendChild(more);
             }
@@ -951,6 +1099,8 @@
             list.insertAdjacentHTML('beforeend', '<div class="sq-none" style="margin-top:8px;">没有符合条件的座位，换个时段/缩短时长试试</div>');
           }
           list.onclick = function (e) {
+            var zrm = e.target.closest('.sq-ztag.custom');
+            if (zrm) { NoPower.remove(NoPower.key(zrm.dataset.zrm, zrm.dataset.zn)); toast('已从自定义无电区移除：' + zrm.dataset.zn + ' 号'); render(true); return; }
             var star = e.target.closest('[data-add]');
             if (star) { Store.add(star.dataset.add, star.dataset.an); toast('已加入高频：' + (ROOMSHORT[star.dataset.add] || '') + ' ' + star.dataset.an); render(); return; }
             var mo = e.target.closest('[data-more]');
