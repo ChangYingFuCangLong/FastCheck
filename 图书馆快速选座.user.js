@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         图书馆座位快速选座助手（河工职大 · 超星座位）
 // @namespace    hbcit.seat.quick
-// @version      1.4.2
+// @version      1.4.6
 // @description  高频座位空窗速览 + 一键预选到官方“提交”前；只读取数据、只帮你选好，提交与验证码永远由本人完成。电脑端(Chrome/Edge+Tampermonkey)与安卓端(Kiwi/Firefox+Tampermonkey)同一份脚本。
 // @match        *://office.chaoxing.com/front/third/apps/seat/*
 // @match        *://*.chaoxing.com/front/third/apps/seat/*
@@ -32,6 +32,7 @@
   var STORE_KEY = 'seatQuick.favs.v1';
   var PENDING_KEY = 'sq.pending';
   var CHAIN_KEY = 'sq.chain';        // 分段连约计划（跨页面跳转保留）
+  var AUTO_KEY = 'seatQuick.autoOpen'; // 进入座位页是否自动展开面板（默认开，'0'=关）
   var DEFAULT_FID = '087075e03ab2e001';
 
   function getFid() {
@@ -138,7 +139,44 @@
         longestTxt: longest >= 60 ? (Math.floor(longest / 60) + 'h' + (longest % 60 ? longest % 60 + 'm' : '')) : '—'
       };
     }
-    return { detail: detail };
+    // 解析房间开放时间/占用，供 detail 与 blocks 复用
+    function roomBasis(data, seatNum, day, serverNowMs) {
+      var st = (data.seatRoom && data.seatRoom.seatSpecialTime) || {};
+      var wk = ['sun', 'mon', 'tues', 'wed', 'thur', 'fri', 'sat'][new Date(day + 'T00:00:00').getDay()];
+      var ss = st[wk + 'StartTime'] || '08:00', se = st[wk + 'EndTime'] || '21:00';
+      var os = +ss.split(':')[0] * 60 + (+ss.split(':')[1] || 0);
+      var oe = +se.split(':')[0] * 60 + (+se.split(':')[1] || 0);
+      var isToday = new Date(serverNowMs).toDateString() === new Date(day + 'T00:00:00').toDateString();
+      var nn = new Date(serverNowMs), nowMin = nn.getHours() * 60 + nn.getMinutes();
+      var occMap = data.groupedReservesMap || {};
+      var occRaw = occMap[String(seatNum)] || occMap[String(Number(seatNum))] ||
+        occMap[String(seatNum).padStart(3, '0')] || [];
+      var merged = [];
+      occRaw.map(function (s) { return [toMin(s.startTime), toMin(s.endTime)]; })
+        .sort(function (a, b) { return a[0] - b[0]; })
+        .forEach(function (x) {
+          if (merged.length && x[0] <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], x[1]);
+          else merged.push(x.slice());
+        });
+      return { os: os, oe: oe, isToday: isToday, nowMin: nowMin, merged: merged,
+        unit: (data.seatConfig && data.seatConfig.timeUnit) || 60 };
+    }
+    function hmMin(m) { return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); }
+    // 逐小时时间块：past=已过 occ=被占 free=可选（与官方时间栏同源）
+    function blocks(data, seatNum, day, serverNowMs) {
+      var B = roomBasis(data, seatNum, day, serverNowMs), out = [];
+      var overlap = function (a, b) { return a[1] > b[0] && b[1] > a[0]; };
+      for (var t = B.os; t < B.oe; t += B.unit) {
+        var blk = [t, Math.min(t + B.unit, B.oe)];
+        var state = 'free';
+        if (B.merged.some(function (m) { return overlap(blk, m); })) state = 'occ';
+        // 与官方一致：今天只能从“下一个整点”开始，当前小时及之前的块一律不可选
+        else if (B.isToday && blk[0] < Math.ceil(B.nowMin / B.unit) * B.unit) state = 'past';
+        out.push({ s: blk[0], e: blk[1], label: hmMin(blk[0]) + '-' + hmMin(blk[1]), state: state });
+      }
+      return out;
+    }
+    return { detail: detail, blocks: blocks };
   })();
 
   /* ---------------- M3 本地收藏 ---------------- */
@@ -210,14 +248,15 @@
       var verify = await openVerify();   // 直接弹出官方安全验证界面，由本人完成
       return { ok: true, seat: vm.chosedSeatNum, start: vm.chosedTimeInfo.startTime, end: vm.chosedTimeInfo.endTime, verify: verify };
     }
-    // 面板点空段：同房同天直接在当前页驱动（不刷新）；页面不对就提示，不擅自跳转
+    // 面板点空段：同房同天直接在当前页驱动（不刷新）；楼层/日期/页面不对就写 pending 自动跳过去续选
     function go(room, num, win, day) {
       var u = new URL(location.href);
       var hereRoom = Number(u.searchParams.get('id')), hereDay = u.searchParams.get('day');
       if (/\/seat\/select/.test(location.pathname) && hereRoom === Number(room) && hereDay === day) {
         return drive(num, win);
       }
-      return Promise.resolve({ err: '当前官方页面不是该楼层/该日期，脚本不会自动刷新；请先从官方页面切到对应楼层与日期再点' });
+      goNav(room, num, win, day);
+      return Promise.resolve({ navigating: true });
     }
     // 强制走“写 pending → 重新进入选座页”路径（用于连约第2段：官方组件无时间复位方法，刷新最稳）
     function goNav(room, num, win, day) {
@@ -384,8 +423,17 @@
           if (timeReady) { clearPending(); setTimeout(openVerify, 350); return; }  // 官方选座后自动弹验证
           var numEl = seat.querySelector('.seat-number'); if (!numEl) return;
           e.preventDefault(); e.stopPropagation();
+          var seatNum = numEl.textContent.trim();
+          // 优先：弹出该座位的“可选时段”底部窗（v1.4.3，手机端点座位即选时段）
+          var mRoom = location.href.match(/[?&]id=(\d+)/);
+          if (mRoom && typeof window.__sqOpenPickerBySeat === 'function') {
+            document.querySelectorAll('.seat-div.sq-pending-seat').forEach(function (d) { d.classList.remove('sq-pending-seat'); });
+            seat.classList.add('sq-pending-seat');
+            window.__sqOpenPickerBySeat(Number(mRoom[1]), seatNum);
+            return;
+          }
           document.querySelectorAll('.seat-div.sq-pending-seat').forEach(function (d) { d.classList.remove('sq-pending-seat'); });
-          pendingSeat = numEl.textContent.trim();
+          pendingSeat = seatNum;
           seat.classList.add('sq-pending-seat');
           toast('已记住 ' + pendingSeat + ' 号，现在去点开始+结束时间块，选完自动帮你选好');
         }
@@ -454,6 +502,30 @@
         '.sq-srow .w{color:#15803d;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
         '.sq-star{flex:none;border:none;background:transparent;color:#f59e0b;font-size:15px;line-height:1;cursor:pointer;padding:0 2px;}' +
         '.sq-more{width:100%;margin-top:5px;border:1px dashed #cbd5e1;background:#fff;color:#475569;border-radius:7px;padding:6px;font-size:12px;cursor:pointer;}' +
+        '#sq-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:2147483002;display:none;}' +
+        '#sq-picker{position:fixed;left:50%;bottom:0;transform:translateX(-50%);width:min(460px,100%);max-height:80vh;background:#fff;border-radius:16px 16px 0 0;box-shadow:0 -8px 30px rgba(0,0,0,.25);z-index:2147483003;display:none;flex-direction:column;padding:13px 13px calc(14px + env(safe-area-inset-bottom));}' +
+        '#sq-picker .pk-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex:none;}' +
+        '#sq-picker .pk-head b{font-size:16px;color:#0f172a;}' +
+        '#sq-picker .pk-head small{color:#64748b;font-size:12px;}' +
+        '#sq-picker .pk-close{margin-left:auto;border:none;background:#f1f5f9;color:#475569;width:30px;height:30px;border-radius:50%;font-size:16px;cursor:pointer;}' +
+        '.pk-quick{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;flex:none;-webkit-overflow-scrolling:touch;}' +
+        '.pk-quick button{flex:none;border:1px solid #16a34a;background:#f0fdf4;color:#15803d;border-radius:16px;padding:6px 12px;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;}' +
+        '.pk-quick .pk-q-tip{flex:none;align-self:center;color:#94a3b8;font-size:11.5px;}' +
+        '.pk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;overflow-y:auto;padding:2px 1px 10px;-webkit-overflow-scrolling:touch;}' +
+        '.pk-grid button{min-height:48px;border-radius:9px;border:1px solid #cbd5e1;background:#fff;color:#334155;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.25;padding:4px 2px;}' +
+        '.pk-grid button b{font-size:12.5px;font-weight:700;}' +
+        '.pk-grid button small{font-size:10px;color:#94a3b8;font-weight:400;}' +
+        '.pk-grid button.occ,.pk-grid button.past{background:#f1f5f9;color:#94a3b8;border-color:#e2e8f0;cursor:not-allowed;}' +
+        '.pk-grid button.occ small{color:#cbd5e1;}' +
+        '.pk-grid button.edge{background:#2563eb;border-color:#2563eb;color:#fff;}' +
+        '.pk-grid button.inr{background:#bfdbfe;border-color:#93c5fd;color:#1e3a8a;}' +
+        '.pk-grid button.edge small,.pk-grid button.inr small{color:#e0e7ff;}' +
+        '.pk-legend{display:flex;gap:12px;font-size:11px;color:#64748b;flex:none;padding:2px 1px 8px;}' +
+        '.pk-legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:3px;vertical-align:-1px;}' +
+        '.pk-foot{display:flex;gap:10px;align-items:center;flex:none;padding-top:9px;border-top:1px solid #e5e7eb;}' +
+        '#pk-sum{flex:1;font-size:13px;color:#475569;}' +
+        '#pk-ok{border:none;background:#16a34a;color:#fff;border-radius:9px;padding:11px 18px;font-size:14.5px;font-weight:700;cursor:pointer;}' +
+        '#pk-ok:disabled{background:#cbd5e1;cursor:not-allowed;}' +
         '</style>' +
         '<button id="sq-launch">⚡ 快速选座</button>' +
         '<div id="sq-panel">' +
@@ -467,6 +539,7 @@
         '<button class="sq-btn" id="sq-refresh">刷新</button>' +
         '<button class="sq-btn ghost" id="sq-pickmode" title="在官方座位图上点座位直接加入高频">⭐点选添加</button>' +
         '<button class="sq-btn ghost" id="sq-assist" title="点两个时间块后自动确认，再点座位即可">⏱ 选时自动确认：开</button>' +
+        '<button class="sq-btn ghost" id="sq-auto" title="进入座位预约页面自动展开本面板">🚀 进入自动展开：开</button>' +
         '<span style="margin-left:auto;font-size:11px;color:#94a3b8;" id="sq-updated"></span></div>' +
         '<div class="sq-tools" style="border-bottom:1px solid #e5e7eb;padding-top:6px;padding-bottom:6px;">' +
         '<label style="font-size:12px;color:#475569;display:flex;align-items:center;gap:4px;flex-wrap:wrap;">指定时段 ' +
@@ -480,8 +553,14 @@
         '<button class="sq-btn" id="sq-goroom" title="在本面板列表中滚动定位到所选楼层分区（不跳转页面）">↓到楼层</button>' +
         '<button class="sq-btn ghost" id="sq-addbtn">☆收藏</button>' +
         '<button class="sq-btn ghost" id="sq-findbtn" title="在官方座位图上闪烁定位该座位（不选座）">◎定位</button></div>' +
-        '<div class="sq-foot">⭐高频置顶，其后按2F→4F列全部空座 · 单次≤4h；选超4h自动拆2段连约（每天限2段共8h）<br>⏱ 两种顺序都行，选好后自动弹出官方安全验证（验证码永远本人点）；“↓到楼层”只在本面板内定位、不刷新页面</div>' +
-        '</div>';
+        '<div class="sq-foot">⭐高频置顶，其后按2F→4F列全部空座 · 单次≤4h；选超4h自动拆2段连约（每天限2段共8h）<br>👆 点座位号弹出时间块（和官方一样点起止格），选好自动弹官方验证（验证码本人点）</div>' +
+        '</div>' +
+        '<div id="sq-mask"></div>' +
+        '<div id="sq-picker"><div class="pk-head"><b id="pk-title">选时间</b><small id="pk-sub"></small><button class="pk-close" id="pk-close">×</button></div>' +
+        '<div class="pk-quick" id="pk-quick"></div>' +
+        '<div class="pk-legend"><span><i style="background:#fff;border:1px solid #cbd5e1;"></i>可选</span><span><i style="background:#f1f5f9;border:1px solid #e2e8f0;"></i>已约/已过</span><span><i style="background:#2563eb;"></i>起止</span><span><i style="background:#bfdbfe;"></i>选中段</span></div>' +
+        '<div class="pk-grid" id="pk-grid"></div>' +
+        '<div class="pk-foot"><span id="pk-sum">点一下开始格，再点一下结束格</span><button id="pk-ok" disabled>确认预约</button></div></div>';
       document.body.appendChild(root);
       // 官方安全验证弹出时自动藏起本面板，避免挡住验证码；关闭后恢复（fixed 元素 offsetParent 为 null，用尺寸判断）
       setInterval(function () {
@@ -528,22 +607,115 @@
           box.style.display = 'none'; box.innerHTML = '';
         };
       }
-      // 发起：≤4h走普通预选；>4h拆两段
+      // 发起：≤4h走普通预选；>4h拆两段。任何结果都必须给用户明确反馈，不许静默
+      function handleRes(r) {
+        if (!r) { toast('预选没有返回结果，请重试一次'); return; }
+        if (r.navigating) { toast('正在进入对应楼层/日期页面，落地后自动为你选好…'); return; }
+        if (r.ok) toast('已为你选好 ' + r.seat + ' 号 ' + r.start + '-' + r.end + '，请在弹出的验证界面本人完成' + (r.verify ? '' : '（验证层没弹出时手动点页面底部“提交”）'));
+        else if (r.err) toast('预选未完成：' + r.err);
+      }
       function startChain(room, num, winText, day, maxDurMin) {
         var w = winMin(winText), s = w[0], e = w[1];
-        if (e - s <= maxDurMin) return Preselect.go(room, num, winText, day);
+        if (e - s <= maxDurMin) { Preselect.go(room, num, winText, day).then(handleRes).catch(function (er) { toast('预选异常：' + (er && er.message || er)); }); return; }
         var e1 = Math.min(e, s + maxDurMin);
         var s2 = e1, e2 = Math.min(e, s2 + maxDurMin);
-        if (e2 - s2 < 60) { toast('剩余时长不足1小时，无法组成第2段，已按第1段 ' + hm2(s) + '-' + hm2(e1) + ' 预选'); return Preselect.go(room, num, hm2(s) + '-' + hm2(e1), day); }
+        if (e2 - s2 < 60) { toast('剩余时长不足1小时，无法组成第2段，已按第1段 ' + hm2(s) + '-' + hm2(e1) + ' 预选'); Preselect.go(room, num, hm2(s) + '-' + hm2(e1), day).then(handleRes); return; }
         var note = e2 < e ? ('每天最多2段共' + (maxDurMin * 2 / 60) + 'h，' + hm2(e2) + ' 之后无法再约，已按前两段规划') : '';
         var c = { room: Number(room), num: num, day: day, s: s, e1: e1, s2: s2, e2: e2, stage: 1, note: note };
         saveChain(c);
         Preselect.go(room, num, hm2(s) + '-' + hm2(e1), day).then(function (r) {
           if (r && r.navigating) { renderChain(loadChain()); return; }  // 跨房间：落地后由 pending 流程处理
           if (r && r.ok) { renderChain(loadChain()); toast('第①段 ' + hm2(s) + '-' + hm2(e1) + ' 已选好并弹出验证，本人完成验证后，点面板里的“约第②段”'); }
-          else if (r && r.err) { toast('第①段预选未完成：' + r.err); }
+          else handleRes(r);
+        }).catch(function (er) { toast('第①段预选异常：' + (er && er.message || er)); });
+      }
+      /* ---- 点座位号 → 仿官方“逐小时时间块”选择器（点起止格，确认后自动选座弹验证） ---- */
+      var PICK = null;
+      function closePicker() {
+        $('#sq-mask').style.display = 'none'; $('#sq-picker').style.display = 'none'; PICK = null;
+        document.querySelectorAll('.seat-div.sq-pending-seat').forEach(function (d) { d.classList.remove('sq-pending-seat'); });
+      }
+      function paintGrid() {
+        var p = PICK, grid = $('#pk-grid'); grid.innerHTML = '';
+        p.blocks.forEach(function (b, i) {
+          var btn = document.createElement('button');
+          var cls = b.state === 'free' ? '' : b.state;
+          if (p.s === i) cls = 'edge';
+          else if (p.e >= 0 && i > Math.min(p.s, p.e) && i < Math.max(p.s, p.e)) cls = 'inr';
+          else if (p.e === i) cls = 'edge';
+          if (cls) btn.className = cls;
+          btn.dataset.i = i;
+          btn.innerHTML = '<b>' + hm2(b.s) + '</b><small>' + (b.state === 'occ' ? '已约' : b.state === 'past' ? '已过' : ('至' + hm2(b.e).slice(0, 2))) + '</small>';
+          grid.appendChild(btn);
         });
       }
+      function updateSum() {
+        var p = PICK, ok = $('#pk-ok'), sum = $('#pk-sum');
+        if (p.s < 0) { ok.disabled = true; sum.textContent = '点一下开始格，再点一下结束格'; return; }
+        var lo = p.s, hi = p.e >= 0 ? p.e : p.s;
+        var a = p.blocks[lo], b = p.blocks[hi];
+        var txt = hm2(a.s) + '-' + hm2(b.e);
+        var hours = (b.e - a.s) / 60;
+        sum.textContent = '已选 ' + txt + '（' + hours + 'h）' + (hours > p.maxMin / 60 ? '，将自动分2段连约' : '');
+        ok.disabled = false; ok.textContent = '确认预约 ' + txt;
+      }
+      function openPicker(room, num, day, maxMin, wins, blks) {
+        PICK = { room: Number(room), num: num, day: day, maxMin: maxMin, blocks: blks || [], s: -1, e: -1 };
+        $('#pk-title').textContent = num + ' 号 · 选时间';
+        $('#pk-sub').textContent = (ROOMSHORT[room] || '') + ' · ' + (day || '');
+        // 顶部快捷空段（一键选最长空窗；超4h标分2段）
+        var q = $('#pk-quick'); q.innerHTML = '<span class="pk-q-tip">快捷</span>';
+        (wins || []).forEach(function (t) {
+          var aa = t.split('-'), dur = parseHM(aa[1]) - parseHM(aa[0]);
+          var b = document.createElement('button');
+          b.textContent = t + (dur > maxMin ? ' ·分2段' : '');
+          b.onclick = function () { try { closePicker(); startChain(Number(room), num, t, day, maxMin); } catch (er) { toast('快捷选座出错：' + (er && er.message || er)); } };
+          q.appendChild(b);
+        });
+        paintGrid(); updateSum();
+        $('#sq-mask').style.display = 'block'; $('#sq-picker').style.display = 'flex';
+        var g = $('#pk-grid');
+        g.onclick = function (ev) {
+          var btn = ev.target.closest('button[data-i]'); if (!btn || !PICK) return;
+          var i = Number(btn.dataset.i), p = PICK;
+          if (p.blocks[i].state !== 'free') { toast('该格已' + (p.blocks[i].state === 'occ' ? '被预约' : '过去') + '，不能选'); return; }
+          if (p.s < 0) { p.s = i; }
+          else if (p.e < 0) {
+            var lo = Math.min(p.s, i), hi = Math.max(p.s, i);
+            var blocked = p.blocks.slice(lo, hi + 1).some(function (x) { return x.state !== 'free'; });
+            if (blocked) { p.s = i; toast('中间有不可选时段，已把这格设为开始'); }
+            else {
+              var maxN = p.maxMin / 60;
+              if (hi - lo + 1 > maxN) {
+                if (i > p.s) hi = p.s + maxN - 1; else lo = p.s - maxN + 1;
+                toast('单次最多 ' + maxN + ' 小时，已自动收边；坐更久走分2段连约');
+              }
+              p.s = lo; p.e = hi;
+            }
+          } else { p.s = i; p.e = -1; }   // 已选完整段后再点=重选
+          paintGrid(); updateSum();
+        };
+        $('#pk-ok').onclick = function () {
+          try {
+            var p = PICK; if (!p || p.s < 0) { toast('请先点选开始和结束时间格'); return; }
+            var hi = p.e >= 0 ? p.e : p.s;
+            var t = hm2(p.blocks[p.s].s) + '-' + hm2(p.blocks[hi].e);
+            closePicker(); startChain(p.room, p.num, t, p.day, p.maxMin);
+          } catch (er) { toast('确认选座出错：' + (er && er.message || er)); }
+        };
+      }
+      $('#sq-mask').onclick = closePicker; $('#pk-close').onclick = closePicker;
+      // 官方座位图上直接点座位（时间还没确认时）→ 现拉该座数据并弹出时间块选择器
+      window.__sqOpenPickerBySeat = function (room, num) {
+        var u = new URL(location.href); var day = u.searchParams.get('day') || ymd(0);
+        toast('正在读取 ' + num + ' 号可约时间…');
+        Data.roomInfo(room, day).then(function (d) {
+          var c = Calc.detail(d, num, day, d.serverNow || Date.now());
+          var max = ((d.seatConfig && d.seatConfig.reserveDuration) || 4) * 60;
+          var blks = Calc.blocks(d, num, day, d.serverNow || Date.now());
+          openPicker(Number(room), String(num).padStart(3, '0'), day, max, c.bookableTxt, blks);
+        }).catch(function () { toast('时间读取失败：请先打开一次快速面板刷新数据'); });
+      };
       $('#sq-day').onclick = function (e) {
         var b = e.target.closest('button'); if (!b) return;
         [].slice.call($('#sq-day').children).forEach(function (x) { x.classList.remove('on'); });
@@ -629,6 +801,12 @@
       function syncAssistBtn() { assistBtn.textContent = '⏱ 选时自动确认：' + (Assist.enabled() ? '开' : '关'); assistBtn.classList.toggle('on', Assist.enabled()); }
       syncAssistBtn();
       assistBtn.onclick = function () { Assist.setOn(!Assist.enabled()); syncAssistBtn(); toast(Assist.enabled() ? '已开启：时间→座位、座位→时间两种顺序都自动补到提交前' : '已关闭，恢复官方原始操作'); };
+      // 进入页面自动展开开关
+      function autoOpenOn() { try { return localStorage.getItem(AUTO_KEY) !== '0'; } catch (e) { return true; } }
+      var autoBtn = $('#sq-auto');
+      function syncAutoBtn() { autoBtn.textContent = '🚀 进入自动展开：' + (autoOpenOn() ? '开' : '关'); autoBtn.classList.toggle('on', autoOpenOn()); }
+      syncAutoBtn();
+      autoBtn.onclick = function () { try { localStorage.setItem(AUTO_KEY, autoOpenOn() ? '0' : '1'); } catch (e) {} syncAutoBtn(); toast(autoOpenOn() ? '已开启：一进座位预约页就自动展开面板' : '已关闭：需要手动点右下角“⚡快速选座”'); };
       // 捕获阶段拦截：点选模式下把“点座位”变成“加入高频”，阻止官方选座逻辑
       document.addEventListener('click', function (e) {
         if (!state.pickMode) return;
@@ -729,6 +907,8 @@
               : '<span class="sq-none">暂无可约整段</span>';
             var card = document.createElement('div');
             card.className = 'sq-card' + (f.c.status === 'full' ? ' full' : '');
+            card.setAttribute('data-pick', '1'); card.dataset.r = f.room; card.dataset.n = f.num;
+            card.dataset.w = f.c.bookableTxt.join('|');
             card.innerHTML =
               '<div class="sq-row1"><span class="sq-no">' + f.num + '</span><span class="sq-tag">' + (ROOMSHORT[f.room] || '') + '</span>' +
               '<span class="sq-badge" style="background:' + bd[1] + ';color:' + bd[2] + '">' + bd[0] + ' · 最长' + f.c.longestTxt + '</span>' +
@@ -755,7 +935,7 @@
                 winDesc = '约 ' + hm(ws) + '-' + hm(we) + (we - ws > 240 ? ' ·分2段' : '') + ((cov[0] === ws && cov[1] === we) ? '' : '（该座空 ' + wtxt(cov) + '）');
               } else winDesc = x.c.bookableTxt.join(' ');
               var t = pickChip(x.c);
-              return '<div class="sq-srow" data-r="' + x.room + '" data-n="' + x.num + '" data-t="' + t + '" title="点此预选（停在提交前）">' +
+              return '<div class="sq-srow" data-pick="1" data-r="' + x.room + '" data-n="' + x.num + '" data-t="' + t + '" data-w="' + x.c.bookableTxt.join('|') + '" title="点座位号弹出可选时段">' +
                 '<span class="n">' + x.num + '</span><span class="w">' + esc(winDesc) + '</span>' +
                 '<button class="sq-star" data-add="' + x.room + '" data-an="' + x.num + '" title="加入高频">☆</button></div>';
             }).join('');
@@ -777,12 +957,23 @@
             if (mo) { state.expanded[mo.dataset.more] = !state.expanded[mo.dataset.more]; render(true); return; }  // 展开时保持滚动位置
             var rm = e.target.closest('[data-rm]');
             if (rm) { Store.remove(rm.dataset.rm, rm.dataset.rn); render(); return; }
-            var ch = e.target.closest('.sq-chip,.sq-srow');
+            // 高频卡上的小空段按钮：一键直达；点座位号/卡片其他位置 → 弹时段选择窗
+            var ch = e.target.closest('.sq-chip');
             if (ch && ch.dataset.t) {
-              var rid0 = Number(ch.dataset.r);
-              var cfg0 = (dmap[rid0] && dmap[rid0].seatConfig) || {};
-              var max0 = (cfg0.reserveDuration || 4) * 60;
-              startChain(rid0, ch.dataset.n, ch.dataset.t, day, max0);
+              var ridC = Number(ch.dataset.r);
+              var cfgC = (dmap[ridC] && dmap[ridC].seatConfig) || {};
+              try { startChain(ridC, ch.dataset.n, ch.dataset.t, day, (cfgC.reserveDuration || 4) * 60); }
+              catch (er) { toast('选座出错：' + (er && er.message || er)); }
+              return;
+            }
+            var pk = e.target.closest('[data-pick]');
+            if (pk) {
+              var ridP = Number(pk.dataset.r);
+              var dP = dmap[ridP], cfgP = (dP && dP.seatConfig) || {};
+              var maxP = (cfgP.reserveDuration || 4) * 60;
+              var winsP = (pk.dataset.w || '').split('|').filter(Boolean);
+              var blksP = dP ? Calc.blocks(dP, pk.dataset.n, day, serverNow) : [];
+              openPicker(ridP, pk.dataset.n, day, maxP, winsP, blksP);
             }
           };
           var d = new Date(serverNow);
@@ -803,9 +994,17 @@
   /* ---------------- 启动 ---------------- */
   function boot() {
     if (!document.body) { setTimeout(boot, 300); return; }
-    UI.init();
+    var inst = UI.init();
     Assist.init();          // 手动连点：时间/座位顺序随意，自动补到提交前
     Preselect.runPending();   // 跨房间跳转落地后自动续跑预选
+    // 进入座位系统自动展开面板（列表页/座位图页都弹；自动续选跳转落地时不弹，避免干扰验证）
+    try {
+      var autoOn = localStorage.getItem(AUTO_KEY) !== '0';
+      var pend = sessionStorage.getItem(PENDING_KEY);
+      if (autoOn && !pend && /\/seat\/(list|select)(\/|$|\?)/.test(location.pathname + location.search)) {
+        setTimeout(function () { inst && inst.open(); }, 250);
+      }
+    } catch (e) {}
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
